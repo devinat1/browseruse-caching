@@ -22,6 +22,7 @@ from browser_use.controller.views import (
 	DragDropAction,
 	GoToUrlAction,
 	InputTextAction,
+	LLMCallAction,
 	NoParamsAction,
 	OpenTabAction,
 	Position,
@@ -287,6 +288,20 @@ class Controller(Generic[Context]):
 				extracted_content=msg,
 				include_in_memory=True,
 			)
+
+		@self.registry.action(
+			'sub agent call',
+			param_model=LLMCallAction,
+		)
+		async def sub_agent_call(params: LLMCallAction, page_extraction_llm: BaseChatModel, browser: BrowserContext):
+			from browser_use.agent.service import Agent
+
+			agent = Agent(llm=page_extraction_llm, task=params.task, browser_context=browser)
+			history = await agent.run(max_steps=params.max_steps)
+			final_result = history.final_result()
+
+			msg = f'Called sub agent with task: {params.task} and got result: {final_result}'
+			return ActionResult(extracted_content=msg, include_in_memory=True)
 
 		# send keys
 		@self.registry.action(

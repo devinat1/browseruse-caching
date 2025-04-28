@@ -71,6 +71,8 @@ class AgentSettings(BaseModel):
 	is_planner_reasoning: bool = False  # type: ignore
 	extend_planner_system_message: Optional[str] = None
 
+	save_workflow_yaml: Optional[str] = None
+
 
 class AgentState(BaseModel):
 	"""Holds all state information for an Agent"""
@@ -242,20 +244,37 @@ class AgentHistoryList(BaseModel):
 		"""Representation of the AgentHistoryList object"""
 		return self.__str__()
 
-	def save_to_file(self, filepath: str | Path) -> None:
-		"""Save history to JSON file with proper serialization"""
+	def save_to_file(self, filepath: str | Path, exclude_screenshots: bool = False) -> None:
+		"""Save history to JSON file with proper serialization
+
+		Args:
+			filepath: Path to save the file to
+			exclude_screenshots: If True, screenshots will be excluded from the saved file
+		"""
 		try:
 			Path(filepath).parent.mkdir(parents=True, exist_ok=True)
-			data = self.model_dump()
+			data = self.model_dump(exclude_screenshots=exclude_screenshots)
 			with open(filepath, 'w', encoding='utf-8') as f:
 				json.dump(data, f, indent=2)
 		except Exception as e:
 			raise e
 
-	def model_dump(self, **kwargs) -> Dict[str, Any]:
-		"""Custom serialization that properly uses AgentHistory's model_dump"""
+	def model_dump(self, exclude_screenshots: bool = False, **kwargs) -> Dict[str, Any]:
+		"""Custom serialization that properly uses AgentHistory's model_dump
+
+		Args:
+			exclude_screenshots: If True, screenshots will be excluded from the dump
+			**kwargs: Additional arguments passed to model_dump
+		"""
+		history_data = []
+		for h in self.history:
+			h_data = h.model_dump(**kwargs)
+			if exclude_screenshots:
+				h_data['state']['screenshot'] = None
+			history_data.append(h_data)
+
 		return {
-			'history': [h.model_dump(**kwargs) for h in self.history],
+			'history': history_data,
 		}
 
 	@classmethod
@@ -350,7 +369,8 @@ class AgentHistoryList(BaseModel):
 			if h.model_output:
 				for action, interacted_element in zip(h.model_output.action, h.state.interacted_element):
 					output = action.model_dump(exclude_none=True)
-					output['interacted_element'] = interacted_element
+					if interacted_element:
+						output['interacted_element'] = interacted_element.to_dict()
 					outputs.append(output)
 		return outputs
 

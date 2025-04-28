@@ -11,6 +11,7 @@ import time
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Generic, List, Optional, TypeVar, Union
 
+import yaml
 from dotenv import load_dotenv
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import (
@@ -58,6 +59,7 @@ from browser_use.telemetry.views import (
 	AgentStepTelemetryEvent,
 )
 from browser_use.utils import check_env_variables, time_execution_async, time_execution_sync
+from browser_use.workflow.views import Workflow
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -91,8 +93,9 @@ class Agent(Generic[Context]):
 	@time_execution_sync('--init (agent)')
 	def __init__(
 		self,
-		task: str,
 		llm: BaseChatModel,
+		task: str | None = None,
+		workflow: Workflow | None = None,
 		# Optional parameters
 		browser: Browser | None = None,
 		browser_context: BrowserContext | None = None,
@@ -126,6 +129,7 @@ class Agent(Generic[Context]):
 		message_context: Optional[str] = None,
 		generate_gif: bool | str = False,
 		available_file_paths: Optional[list[str]] = None,
+		save_workflow_yaml: Optional[str] = 'workflow.yaml',
 		include_attributes: list[str] = [
 			'title',
 			'type',
@@ -156,9 +160,13 @@ class Agent(Generic[Context]):
 		if page_extraction_llm is None:
 			page_extraction_llm = llm
 
+		if workflow is None and task is None:
+			raise ValueError('Either task or workflow must be provided')
+
 		# Core components
-		self.task = task
 		self.llm = llm
+		self.task = task
+		self.workflow = workflow
 		self.controller = controller
 		self.sensitive_data = sensitive_data
 
@@ -183,7 +191,10 @@ class Agent(Generic[Context]):
 			planner_llm=planner_llm,
 			planner_interval=planner_interval,
 			is_planner_reasoning=is_planner_reasoning,
-			extend_planner_system_message=extend_planner_system_message,
+			enable_memory=enable_memory,
+			# memory_interval=memory_interval,
+			memory_config=memory_config,
+			save_workflow_yaml=save_workflow_yaml,
 		)
 
 		# Memory settings
@@ -197,6 +208,10 @@ class Agent(Generic[Context]):
 		self._setup_action_models()
 		self._set_browser_use_version_and_source()
 		self.initial_actions = self._convert_initial_actions(initial_actions) if initial_actions else None
+		if self.workflow:
+			raw_cached_actions = self.workflow.get_raw_action_dict()
+			cached_actions = self._convert_initial_actions(raw_cached_actions)
+			self.workflow.actions = cached_actions
 
 		# Model setup
 		self._set_model_names()
@@ -471,30 +486,22 @@ class Agent(Generic[Context]):
 			tokens = self._message_manager.state.history.current_tokens
 
 			try:
-				model_output = await self.get_next_action(input_messages)
-				if (
-					not model_output.action
-					or not isinstance(model_output.action, list)
-					or all(action.model_dump() == {} for action in model_output.action)
-				):
-					logger.warning('Model returned empty action. Retrying...')
+				if self.workflow:
+					model_output, interacted_element = self.workflow.get_current_model_output()
+					if model_output is None or len(model_output.action) == 0:
+						raise ValueError('Workflow is done')
 
-					clarification_message = HumanMessage(
-						content='You forgot to return an action. Please respond only with a valid JSON action according to the expected format.'
-					)
+					if interacted_element:
+						# update index of action in current state based on past interacted element
+						new_action = await self._update_action_indices(interacted_element, model_output.action[0], state)
+						if new_action:
+							model_output.action[0] = new_action
+							logger.info(f'Updated action: {model_output.action[0]}')
+						else:
+							raise ValueError('Workflow element not found in current state')
 
-					retry_messages = input_messages + [clarification_message]
-					model_output = await self.get_next_action(retry_messages)
-
-					if not model_output.action or all(action.model_dump() == {} for action in model_output.action):
-						logger.warning('Model still returned empty after retry. Inserting safe noop action.')
-						action_instance = self.ActionModel(
-							done={
-								'success': False,
-								'text': 'No next action returned by LLM!',
-							}
-						)
-						model_output.action = [action_instance]
+				else:
+					model_output = await self.get_next_action(input_messages)
 
 				# Check again for paused/stopped state after getting model output
 				# This is needed in case Ctrl+C was pressed during the get_next_action call
@@ -538,6 +545,8 @@ class Agent(Generic[Context]):
 				logger.info(f'📄 Result: {result[-1].extracted_content}')
 
 			self.state.consecutive_failures = 0
+			if self.workflow:
+				self.workflow.next_action()
 
 		except InterruptedError:
 			# logger.debug('Agent paused')
@@ -903,7 +912,8 @@ class Agent(Generic[Context]):
 			)
 
 			await self.close()
-
+			if self.settings.save_workflow_yaml:
+				await self.save_workflow()
 			if self.settings.generate_gif:
 				output_path: str = 'agent_history.gif'
 				if isinstance(self.settings.generate_gif, str):
@@ -1138,7 +1148,9 @@ class Agent(Generic[Context]):
 		if not historical_element or not current_state.element_tree:
 			return action
 
-		current_element = HistoryTreeProcessor.find_history_element_in_tree(historical_element, current_state.element_tree)
+		current_element = HistoryTreeProcessor.find_history_element_in_tree(
+			historical_element, current_state.element_tree, match_criteria=['css_selector']
+		)
 
 		if not current_element or current_element.highlight_index is None:
 			return None
@@ -1163,11 +1175,16 @@ class Agent(Generic[Context]):
 		history = AgentHistoryList.load_from_file(history_file, self.AgentOutput)
 		return await self.rerun_history(history, **kwargs)
 
-	def save_history(self, file_path: Optional[str | Path] = None) -> None:
-		"""Save the history to a file"""
+	def save_history(self, file_path: Optional[str | Path] = None, exclude_screenshots: bool = False) -> None:
+		"""Save the history to a file
+
+		Args:
+			file_path: Path to save the file to. Defaults to 'AgentHistory.json'
+			exclude_screenshots: If True, screenshots will be excluded from the saved file
+		"""
 		if not file_path:
 			file_path = 'AgentHistory.json'
-		self.state.history.save_to_file(file_path)
+		self.state.history.save_to_file(file_path, exclude_screenshots=exclude_screenshots)
 
 	def pause(self) -> None:
 		"""Pause the agent before the next step"""
@@ -1369,3 +1386,11 @@ class Agent(Generic[Context]):
 		# Update done action model too
 		self.DoneActionModel = self.controller.registry.create_action_model(include_actions=['done'], page=page)
 		self.DoneAgentOutput = AgentOutput.type_with_custom_actions(self.DoneActionModel)
+
+	async def save_workflow(self):
+		"""Create a workflow from a yaml file from history"""
+		actions = self.state.history.model_actions()
+
+		# save actions to yaml file
+		with open(self.settings.save_workflow_yaml, 'w') as f:
+			yaml.dump(actions, f)
