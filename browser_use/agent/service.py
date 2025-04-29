@@ -96,6 +96,7 @@ class Agent(Generic[Context]):
 		llm: BaseChatModel,
 		task: str | None = None,
 		workflow: Workflow | None = None,
+		execute_playwright_commands: bool = False,
 		# Optional parameters
 		browser: Browser | None = None,
 		browser_context: BrowserContext | None = None,
@@ -207,8 +208,9 @@ class Agent(Generic[Context]):
 		# Action setup
 		self._setup_action_models()
 		self._set_browser_use_version_and_source()
+		self.execute_playwright_commands = execute_playwright_commands
 		self.initial_actions = self._convert_initial_actions(initial_actions) if initial_actions else None
-		if self.workflow:
+		if self.workflow and not self.execute_playwright_commands:
 			raw_cached_actions = self.workflow.get_raw_action_dict()
 			cached_actions = self._convert_initial_actions(raw_cached_actions)
 			self.workflow.actions = cached_actions
@@ -416,7 +418,7 @@ class Agent(Generic[Context]):
 			raise InterruptedError
 
 	# @observe(name='agent.step', ignore_output=True, ignore_input=True)
-	@time_execution_async('--step (agent)')
+	# @time_execution_async('--step (agent)')
 	async def step(self, step_info: Optional[AgentStepInfo] = None) -> None:
 		"""Execute one step of the task"""
 		logger.info(f'📍 Step {self.state.n_steps}')
@@ -455,7 +457,7 @@ class Agent(Generic[Context]):
 				if page_filtered_actions:
 					all_actions += '\n' + page_filtered_actions
 
-				context_lines = (self._message_manager.settings.message_context or '').split('\n')
+				context_lines = (self._message_manager.settings.message_context or '').split('\n',)
 				non_action_lines = [line for line in context_lines if not line.startswith('Available actions:')]
 				updated_context = '\n'.join(non_action_lines)
 				if updated_context:
@@ -485,9 +487,44 @@ class Agent(Generic[Context]):
 			input_messages = self._message_manager.get_messages()
 			tokens = self._message_manager.state.history.current_tokens
 
+			# If using a workflow of raw Playwright commands, execute them directly
 			try:
+				if self.workflow and self.execute_playwright_commands:
+					workflow_action = self.workflow.raw_actions[self.step_index]
+					try:
+						# Try the cached Playwright command
+						page = await self.browser_context.get_current_page()
+						if not hasattr(page, workflow_action.action_name):
+							raise ValueError(f'Unsupported playwright command: {workflow_action.action_name}')
+						method = getattr(page, workflow_action.action_name)
+						result_value = await method(**workflow_action.parameters)
+						from browser_use.agent.views import ActionResult
+
+						self.state.last_result = [
+							ActionResult(extracted_content=str(result_value) if result_value is not None else '')
+						]
+						# Advance workflow
+						self.workflow.next_action()
+						return
+					except Exception as e:
+						logger.warning(
+							f'Playwright command failed at step {self.step_index}: {e}. '
+							'Falling back to LLM controller and updating cache.'
+						)
+						# 1) Generate new actions via LLM
+						model_output = await self.get_next_action(self._message_manager.get_messages())
+
+						# 2) Overwrite remaining cached commands with new ones
+						new_raw = [action.model_dump() for action in model_output.action]
+						self.workflow.raw_actions[self.step_index:] = new_raw
+
+						# 3) Execute the new actions and record results
+						result = await self.multi_act(model_output.action)
+						self.state.last_result = result
+						return
+
 				if self.workflow:
-					model_output, interacted_element = self.workflow.get_current_model_output()
+					model_output, interacted_element = self.workflow.get_current_model_output()  # This is where the decision of where to go to is decided
 					if model_output is None or len(model_output.action) == 0:
 						raise ValueError('Workflow is done')
 
@@ -802,7 +839,7 @@ class Agent(Generic[Context]):
 		return False, False
 
 	# @observe(name='agent.run', ignore_output=True)
-	@time_execution_async('--run (agent)')
+	# @time_execution_async('--run (agent)')
 	async def run(
 		self, max_steps: int = 100, on_step_start: AgentHookFunc | None = None, on_step_end: AgentHookFunc | None = None
 	) -> AgentHistoryList:
@@ -823,7 +860,7 @@ class Agent(Generic[Context]):
 		signal_handler.register()
 
 		try:
-			self._log_agent_run()
+			# self._log_agent_run()
 
 			# Execute initial actions if provided
 			if self.initial_actions:
@@ -923,7 +960,7 @@ class Agent(Generic[Context]):
 
 	# @observe(name='controller.multi_act')
 	@time_execution_async('--multi-act (agent)')
-	async def multi_act(
+	async def multi_act(  # Multiple actions occur at once before going on to the next action
 		self,
 		actions: list[ActionModel],
 		check_for_new_elements: bool = True,
@@ -934,7 +971,7 @@ class Agent(Generic[Context]):
 		cached_selector_map = await self.browser_context.get_selector_map()
 		cached_path_hashes = set(e.hash.branch_path_hash for e in cached_selector_map.values())
 
-		await self.browser_context.remove_highlights()
+		await self.browser_context.remove_highlights()  # This is where the set of marks is removed
 
 		for i, action in enumerate(actions):
 			if action.get_index() is not None and i != 0:
@@ -963,7 +1000,7 @@ class Agent(Generic[Context]):
 			try:
 				await self._raise_if_stopped_or_paused()
 
-				result = await self.controller.act(
+				result = await self.controller.act(  # Where the actions themselves actually take place
 					action,
 					self.browser_context,
 					self.settings.page_extraction_llm,
@@ -1074,7 +1111,7 @@ class Agent(Generic[Context]):
 		"""
 		# Execute initial actions if provided
 		if self.initial_actions:
-			result = await self.multi_act(self.initial_actions)
+			result = await self.multi_act(self.initial_actions)  # TODO Here are where the initial actions could be replaced by my workflow, but not sure where rerun_history is called.
 			self.state.last_result = result
 
 		results = []
@@ -1386,11 +1423,3 @@ class Agent(Generic[Context]):
 		# Update done action model too
 		self.DoneActionModel = self.controller.registry.create_action_model(include_actions=['done'], page=page)
 		self.DoneAgentOutput = AgentOutput.type_with_custom_actions(self.DoneActionModel)
-
-	async def save_workflow(self):
-		"""Create a workflow from a yaml file from history"""
-		actions = self.state.history.model_actions()
-
-		# save actions to yaml file
-		with open(self.settings.save_workflow_yaml, 'w') as f:
-			yaml.dump(actions, f)

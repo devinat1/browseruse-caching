@@ -752,6 +752,39 @@ class Controller(Generic[Context]):
 		"""
 		return self.registry.action(description, **kwargs)
 
+	def register_workflow(
+		self,
+		name: str,
+		description: str,
+		yaml_file: str,
+		param_model: type[BaseModel],
+	) -> None:
+		"""Register a named workflow (playwright commands) as an agent action"""
+		from browser_use.workflow.views import Workflow
+		from browser_use.controller.registry.views import RegisteredAction
+
+		# Define workflow executor function
+		async def workflow_executor(params: param_model, browser: BrowserContext) -> ActionResult:
+			wf = Workflow(yaml_file, **params.model_dump())
+			results = []
+			for raw_step in wf.raw_actions:
+				page = await browser.get_current_page()
+				cmd = raw_step.action_name
+				if not hasattr(page, cmd):
+					raise ValueError(f"Unsupported playwright command: {cmd}")
+				result = await getattr(page, cmd)(**raw_step.parameters)
+				results.append(result)
+			return ActionResult(extracted_content=str(results))
+
+		# Register the workflow action
+		action = RegisteredAction(
+			name=name,
+			description=description,
+			function=workflow_executor,
+			param_model=param_model,
+		)
+		self.registry.registry.actions[name] = action
+
 	# Act --------------------------------------------------------------------
 
 	@time_execution_sync('--act')
